@@ -87,11 +87,7 @@ class CustomAgentActivity(AgentActivity):
         if not words:
             return True
 
-        interrupt_set = getattr(self._config, 'interrupt_words', {"stop", "wait"})
         ignored_set = getattr(self._config, 'ignored_words', {"yeah", "ok", "hmm"})
-
-        if any(w in interrupt_set for w in words):
-            return False 
 
         return all(w in ignored_set for w in words)
 
@@ -102,14 +98,12 @@ class IntelligentInterruptSession(AgentSession):
 
     def __init__(
         self, 
-        interrupt_words: Optional[Set[str]] = None, 
         ignored_words: Optional[Set[str]] = None, 
         *args, 
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         
-        self.interrupt_words = interrupt_words or {"stop", "wait", "hold", "no", "cancel", "pause"}
         self.ignored_words = ignored_words or {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
 
     async def _update_activity(
