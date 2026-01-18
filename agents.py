@@ -26,8 +26,12 @@ async def entrypoint(ctx: JobContext):
         instructions="You are a friendly voice assistant built by LiveKit.",
         tools=[lookup_weather],
     )
-    
+    interrupt_words = {"stop", "wait", "hold", "no", "cancel", "pause"}
+    ignored_words = {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
+
     session = IntelligentInterruptSession(
+        interrupt_words=interrupt_words,
+        ignored_words=ignored_words,
         vad=silero.VAD.load(),
         stt="deepgram/nova-2:en",
         llm="openai/gpt-4o-mini",

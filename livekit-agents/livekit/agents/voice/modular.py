@@ -1,40 +1,31 @@
-from typing import TYPE_CHECKING, Literal
-import asyncio
-import string # Needed for the punctuation removal
-
-# --- 1. Fix Imports ---
-from livekit.agents.voice import AgentSession  # <--- MUST import AgentActivity
-from livekit.agents.voice.agent_activity import AgentActivity  # <--- MUST import AgentActivity
-from livekit.agents.llm import AgentHandoff
-from opentelemetry import context as otel_context
-from livekit.agents import llm, stt, tts, utils, vad # Ensure these are imported from livekit.agents
-from livekit.agents.tokenize.basic import split_words
-
-if TYPE_CHECKING:
-    from livekit.agents import Agent
-
-# --- 2. Fix Inheritance ---
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Set, Optional
 import asyncio
 import string 
 
+# 1. Imports
 from livekit.agents.voice import AgentSession
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.llm import AgentHandoff
 from opentelemetry import context as otel_context
 from livekit.agents import llm, stt, tts, utils, vad
 from livekit.agents.tokenize.basic import split_words
-# You need this import for the type hint in on_end_of_turn
 from livekit.agents.voice.audio_recognition import _EndOfTurnInfo 
 
 if TYPE_CHECKING:
     from livekit.agents import Agent
 
+# --- 2. Custom Activity ---
 class CustomAgentActivity(AgentActivity):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    # --- 1. PREVENT INTERRUPTION (Agent keeps talking) ---
+    # Helper to get configuration safely
+    @property
+    def _config(self):
+        # We assume the session is our custom one. 
+        # If not, fall back to defaults to prevent crashing.
+        return self._session
+
     def _interrupt_by_audio_activity(self) -> None:
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
@@ -42,13 +33,11 @@ class CustomAgentActivity(AgentActivity):
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.turn_detection:
             return
 
-        # Check if we should ignore this noise
         if self.stt is not None and self._audio_recognition is not None:
             text = self._audio_recognition.current_transcript
             if self._is_ignorable_transcript(text):
                 return
 
-        # Legacy word count check
         if (
             self.stt is not None
             and opt.min_interruption_words > 0
@@ -79,9 +68,7 @@ class CustomAgentActivity(AgentActivity):
                     self._rt_session.interrupt()
                 self._current_speech.interrupt()
 
-    # --- 2. PREVENT LLM PROCESSING (Don't send "Yeah" to the brain) ---
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
-        # Check for ignorable text again at the end of the turn
         if (
             self.stt is not None
             and self._turn_detection != "manual"
@@ -89,15 +76,12 @@ class CustomAgentActivity(AgentActivity):
             and self._current_speech.allow_interruptions
             and not self._current_speech.interrupted
         ):
-             # Use the same helper function
             if self._is_ignorable_transcript(info.new_transcript):
                 self._cancel_preemptive_generation()
-                return False  # <--- RETURN FALSE DROPS THE TURN
+                return False 
 
-        # If it wasn't ignored, run the standard logic
         return super().on_end_of_turn(info)
 
-    # --- HELPER FUNCTION ---
     def _is_ignorable_transcript(self, text: str) -> bool:
         if not text or not text.strip():
             return True
@@ -108,23 +92,37 @@ class CustomAgentActivity(AgentActivity):
         if not words:
             return True
 
-        interrupt_words = {"stop", "wait", "hold", "no", "cancel", "pause"}
-        if any(w in interrupt_words for w in words):
+        # --- KEY CHANGE: Access words from the Session instance ---
+        # Default fallback sets are provided just in case
+        interrupt_set = getattr(self._config, 'interrupt_words', {"stop", "wait"})
+        ignored_set = getattr(self._config, 'ignored_words', {"yeah", "ok", "hmm"})
+        # --------------------------------------------------------
+
+        if any(w in interrupt_set for w in words):
             return False 
 
-        ignored_words = {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
-        return all(w in ignored_words for w in words)
+        return all(w in ignored_set for w in words)
 
+
+# --- 3. Custom Session ---
 class IntelligentInterruptSession(AgentSession):
-    # This part was correct
     _activity: CustomAgentActivity | None = None
     _next_activity: CustomAgentActivity | None = None
 
-    def __init__(self, *args, **kwargs):
-        """Initialize the custom session."""
+    # Fix: Use arguments with defaults instead of ignoring input
+    def __init__(
+        self, 
+        interrupt_words: Optional[Set[str]] = None, 
+        ignored_words: Optional[Set[str]] = None, 
+        *args, 
+        **kwargs
+    ):
         super().__init__(*args, **kwargs)
-    
-    # This override logic was correct, just ensure imports like AgentHandoff/otel_context exist
+        
+        # 1. Set Defaults if None passed
+        self.interrupt_words = interrupt_words or {"stop", "wait", "hold", "no", "cancel", "pause"}
+        self.ignored_words = ignored_words or {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
+
     async def _update_activity(
         self,
         agent,
