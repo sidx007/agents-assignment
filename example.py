@@ -8,7 +8,7 @@ from livekit.agents import (
     function_tool,
 )
 from livekit.plugins import silero
-from livekit.agents.voice.modular import IntelligentInterruptSession
+from livekit.agents.voice.interrupt_layer import IntelligentInterruptSession
 
 @function_tool
 async def lookup_weather(
@@ -38,7 +38,6 @@ async def entrypoint(ctx: JobContext):
         tts="cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
     )
 
-    # Add event handlers for logging transcripts
     @session.on("user_input_transcribed")
     def on_user_transcript(event):
         print(f"🎤 USER: {event.transcript} (final: {event.is_final})")

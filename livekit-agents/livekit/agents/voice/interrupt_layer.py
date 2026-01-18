@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING, Literal, Set, Optional
 import asyncio
 import string 
 
-# 1. Imports
 from livekit.agents.voice import AgentSession
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.llm import AgentHandoff
@@ -14,16 +13,12 @@ from livekit.agents.voice.audio_recognition import _EndOfTurnInfo
 if TYPE_CHECKING:
     from livekit.agents import Agent
 
-# --- 2. Custom Activity ---
 class CustomAgentActivity(AgentActivity):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    # Helper to get configuration safely
     @property
     def _config(self):
-        # We assume the session is our custom one. 
-        # If not, fall back to defaults to prevent crashing.
         return self._session
 
     def _interrupt_by_audio_activity(self) -> None:
@@ -92,11 +87,8 @@ class CustomAgentActivity(AgentActivity):
         if not words:
             return True
 
-        # --- KEY CHANGE: Access words from the Session instance ---
-        # Default fallback sets are provided just in case
         interrupt_set = getattr(self._config, 'interrupt_words', {"stop", "wait"})
         ignored_set = getattr(self._config, 'ignored_words', {"yeah", "ok", "hmm"})
-        # --------------------------------------------------------
 
         if any(w in interrupt_set for w in words):
             return False 
@@ -104,12 +96,10 @@ class CustomAgentActivity(AgentActivity):
         return all(w in ignored_set for w in words)
 
 
-# --- 3. Custom Session ---
 class IntelligentInterruptSession(AgentSession):
     _activity: CustomAgentActivity | None = None
     _next_activity: CustomAgentActivity | None = None
 
-    # Fix: Use arguments with defaults instead of ignoring input
     def __init__(
         self, 
         interrupt_words: Optional[Set[str]] = None, 
@@ -119,7 +109,6 @@ class IntelligentInterruptSession(AgentSession):
     ):
         super().__init__(*args, **kwargs)
         
-        # 1. Set Defaults if None passed
         self.interrupt_words = interrupt_words or {"stop", "wait", "hold", "no", "cancel", "pause"}
         self.ignored_words = ignored_words or {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
 
@@ -142,14 +131,12 @@ class IntelligentInterruptSession(AgentSession):
                 ):
                     raise RuntimeError("cannot start agent: an activity is already running")
 
-                # *** THE CRITICAL CHANGE ***
                 self._next_activity = CustomAgentActivity(agent, self)
-                # ***************************
 
             elif new_activity == "resume":
                 if agent._activity is None:
                     raise RuntimeError("cannot resume agent: no existing active activity to resume")
-                self._next_activity = agent._activity # type: ignore
+                self._next_activity = agent._activity 
 
             if self._root_span_context is not None:
                 otel_context.attach(self._root_span_context)
