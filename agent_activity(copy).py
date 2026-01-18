@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from interruptions import allowInterruption
 import asyncio
 import contextvars
 import heapq
@@ -76,6 +76,8 @@ from .generation import (
 )
 from .speech_handle import SpeechHandle
 
+import string
+
 if TYPE_CHECKING:
     from ..llm import mcp
     from .agent_session import AgentSession
@@ -103,16 +105,9 @@ class _PreemptiveGeneration:
     tool_choice: llm.ToolChoice | None
     created_at: float
 
-
-import string as _string
-
+    
 # NOTE: AgentActivity isn't exposed to the public API
 class AgentActivity(RecognitionHooks):
-    # Filler words that should NOT trigger an interruption
-    _IGNORED_WORDS = {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup", "uh", "um"}
-    # Words that should ALWAYS trigger an interruption
-    _INTERRUPT_WORDS = {"stop", "wait", "hold", "no", "cancel", "pause"}
-
     def __init__(self, agent: Agent, sess: AgentSession) -> None:
         self._agent, self._session = agent, sess
         self._rt_session: llm.RealtimeSession | None = None
@@ -170,7 +165,40 @@ class AgentActivity(RecognitionHooks):
 
         # speeches that audio playout finished but not done because of tool calls
         self._background_speeches: set[SpeechHandle] = set()
+    def _is_ignorable_transcript(self, text: str) -> bool:
+        """
+        Decides if the agent should IGNORE the user input.
+        Returns True = Ignore (Agent keeps speaking).
+        Returns False = Interrupt (Agent stops).
+        """
+        # 1. Anti-Stutter Guard (VAD Latency Fix) [cite: 47]
+        # VAD triggers before STT. Text is empty. We MUST ignore to prevent stuttering.
+        if not text or not text.strip():
+            return True
 
+        import string
+        clean_text = text.lower().translate(str.maketrans("", "", string.punctuation)).strip()
+        words = clean_text.split()
+        
+        if not words:
+            return True
+
+        # 2. Explicit Interruption Triggers (High Priority) [cite: 39, 40]
+        # If ANY of these words are present, we must interrupt immediately,
+        # even if they are mixed with filler words (e.g., "Yeah but stop").
+        interrupt_words = {"stop", "wait", "hold", "no", "cancel", "pause"}
+        
+        if any(w in interrupt_words for w in words):
+            return False  # <--- HARD STOP
+
+        # 3. Passive Acknowledgement List (The Ignore List) [cite: 37]
+        ignored_words = {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
+
+        # 4. The Logic Check
+        # We ignore ONLY if the entire sentence consists of backchanneling words.
+        # "Yeah ok" -> True (Ignore)
+        # "Yeah I agree" -> False (Interrupt, because "I" and "agree" are not ignored)
+        return all(w in ignored_words for w in words)
     def _validate_turn_detection(
         self, turn_detection: TurnDetectionMode | None
     ) -> TurnDetectionMode | None:
@@ -1173,57 +1201,33 @@ class AgentActivity(RecognitionHooks):
         )
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
-    def _is_ignorable_transcript(self, text: str) -> bool:
-        """
-        Decides if the agent should IGNORE the user input.
-        Returns True = Ignore (Agent keeps speaking).
-        Returns False = Interrupt (Agent stops).
-        """
-        # 1. Anti-Stutter Guard: VAD triggers before STT, text may be empty
-        if not text or not text.strip():
-            return True
-
-        clean_text = text.lower().translate(str.maketrans("", "", _string.punctuation)).strip()
-        words = clean_text.split()
-
-        if not words:
-            return True
-
-        # 2. Explicit Interruption Triggers (High Priority)
-        # If ANY of these words are present, we must interrupt immediately
-        if any(w in self._INTERRUPT_WORDS for w in words):
-            return False  # Do NOT ignore - this is an intentional interrupt
-
-        # 3. Ignore ONLY if the entire sentence consists of filler words
-        # "Yeah ok" -> True (Ignore)
-        # "Yeah I agree" -> False (Interrupt, because "I" and "agree" are not filler)
-        return all(w in self._IGNORED_WORDS for w in words)
-
     def _interrupt_by_audio_activity(self) -> None:
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
 
+        # 1. Server-Side Check (Standard Safeguard)
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.turn_detection:
-            # ignore if realtime model has turn detection enabled
             return
 
-        # Check if we should ignore this transcript (filler words like "yeah", "ok")
+        # 2. THE SOLUTION: Check if we should ignore this noise
         if self.stt is not None and self._audio_recognition is not None:
             text = self._audio_recognition.current_transcript
+            
+            # Use our helper to check for Empty Text OR Filler Words
             if self._is_ignorable_transcript(text):
                 return
 
+        # (Optional: Keep legacy word count check if you use it in config)
         if (
             self.stt is not None
             and opt.min_interruption_words > 0
             and self._audio_recognition is not None
         ):
             text = self._audio_recognition.current_transcript
-
-            # TODO(long): better word splitting for multi-language
             if len(split_words(text, split_character=True)) < opt.min_interruption_words:
                 return
 
+        # 3. Execute Interruption (Only if we didn't return above)
         if self._rt_session is not None:
             self._rt_session.start_user_activity()
 
@@ -1234,7 +1238,6 @@ class AgentActivity(RecognitionHooks):
         ):
             self._paused_speech = self._current_speech
 
-            # reset the false interruption timer
             if self._false_interruption_timer:
                 self._false_interruption_timer.cancel()
                 self._false_interruption_timer = None
@@ -1245,10 +1248,7 @@ class AgentActivity(RecognitionHooks):
             else:
                 if self._rt_session is not None:
                     self._rt_session.interrupt()
-
                 self._current_speech.interrupt()
-
-    # region recognition hooks
 
     def on_start_of_speech(self, ev: vad.VADEvent | None) -> None:
         self._session._update_user_state("speaking")
@@ -1401,9 +1401,35 @@ class AgentActivity(RecognitionHooks):
                 self._agent._chat_ctx.items.append(user_message)
                 self._session._conversation_item_added(user_message)
 
-            # TODO(theomonnom): should we "forward" this new turn to the next agent/activity?
             return True
 
+        # --- FIX START: IGNORE FILLER WORDS ---
+        # If the agent is currently speaking, and the user just finished saying 
+        # a filler word (like "Yeah"), we reject this turn.
+        # This prevents the LLM from interrupting itself to answer "Yeah".
+        if (
+            self.stt is not None
+            and self._turn_detection != "manual"
+            and self._current_speech is not None           # Agent is Speaking
+            and self._current_speech.allow_interruptions
+            and not self._current_speech.interrupted
+        ):
+            # 1. Define filler words (Keep strictly lowercase)
+            ignored_words = {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
+            
+            # 2. Clean the text (remove punctuation & lowercase)
+            import string
+            text = info.new_transcript
+            clean_text = text.lower().translate(str.maketrans("", "", string.punctuation)).strip()
+            words = clean_text.split()
+
+            # 3. Check: If we have words, and ALL of them are in the ignore list
+            if words and all(w in ignored_words for w in words):
+                self._cancel_preemptive_generation()
+                return False  # <--- STOP HERE (Do not send to LLM)
+        # --- FIX END ---
+
+        # (Original Logic: Short word count check)
         if (
             self.stt is not None
             and self._turn_detection != "manual"
