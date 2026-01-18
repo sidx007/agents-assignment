@@ -8,7 +8,7 @@ from livekit.agents import (
     function_tool,
 )
 from livekit.plugins import silero
-from modular import IntelligentInterruptSession
+from livekit.agents.voice.modular import IntelligentInterruptSession
 
 @function_tool
 async def lookup_weather(

@@ -104,15 +104,8 @@ class _PreemptiveGeneration:
     created_at: float
 
 
-import string as _string
-
 # NOTE: AgentActivity isn't exposed to the public API
 class AgentActivity(RecognitionHooks):
-    # Filler words that should NOT trigger an interruption
-    _IGNORED_WORDS = {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup", "uh", "um"}
-    # Words that should ALWAYS trigger an interruption
-    _INTERRUPT_WORDS = {"stop", "wait", "hold", "no", "cancel", "pause"}
-
     def __init__(self, agent: Agent, sess: AgentSession) -> None:
         self._agent, self._session = agent, sess
         self._rt_session: llm.RealtimeSession | None = None
@@ -1173,32 +1166,6 @@ class AgentActivity(RecognitionHooks):
         )
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
-    def _is_ignorable_transcript(self, text: str) -> bool:
-        """
-        Decides if the agent should IGNORE the user input.
-        Returns True = Ignore (Agent keeps speaking).
-        Returns False = Interrupt (Agent stops).
-        """
-        # 1. Anti-Stutter Guard: VAD triggers before STT, text may be empty
-        if not text or not text.strip():
-            return True
-
-        clean_text = text.lower().translate(str.maketrans("", "", _string.punctuation)).strip()
-        words = clean_text.split()
-
-        if not words:
-            return True
-
-        # 2. Explicit Interruption Triggers (High Priority)
-        # If ANY of these words are present, we must interrupt immediately
-        if any(w in self._INTERRUPT_WORDS for w in words):
-            return False  # Do NOT ignore - this is an intentional interrupt
-
-        # 3. Ignore ONLY if the entire sentence consists of filler words
-        # "Yeah ok" -> True (Ignore)
-        # "Yeah I agree" -> False (Interrupt, because "I" and "agree" are not filler)
-        return all(w in self._IGNORED_WORDS for w in words)
-
     def _interrupt_by_audio_activity(self) -> None:
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
@@ -1206,12 +1173,6 @@ class AgentActivity(RecognitionHooks):
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.turn_detection:
             # ignore if realtime model has turn detection enabled
             return
-
-        # Check if we should ignore this transcript (filler words like "yeah", "ok")
-        if self.stt is not None and self._audio_recognition is not None:
-            text = self._audio_recognition.current_transcript
-            if self._is_ignorable_transcript(text):
-                return
 
         if (
             self.stt is not None
