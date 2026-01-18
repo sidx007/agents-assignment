@@ -3,7 +3,8 @@ import asyncio
 import string # Needed for the punctuation removal
 
 # --- 1. Fix Imports ---
-from livekit.agents.voice import AgentSession, AgentActivity  # <--- MUST import AgentActivity
+from livekit.agents.voice import AgentSession  # <--- MUST import AgentActivity
+from livekit.agents.voice.agent_activity import AgentActivity  # <--- MUST import AgentActivity
 from livekit.agents.llm import AgentHandoff
 from opentelemetry import context as otel_context
 from livekit.agents import llm, stt, tts, utils, vad # Ensure these are imported from livekit.agents
@@ -13,23 +14,37 @@ if TYPE_CHECKING:
     from livekit.agents import Agent
 
 # --- 2. Fix Inheritance ---
-class CustomAgentActivity(AgentActivity): # <--- CHANGED from (Agent) to (AgentActivity)
+from typing import TYPE_CHECKING, Literal
+import asyncio
+import string 
+
+from livekit.agents.voice import AgentSession
+from livekit.agents.voice.agent_activity import AgentActivity
+from livekit.agents.llm import AgentHandoff
+from opentelemetry import context as otel_context
+from livekit.agents import llm, stt, tts, utils, vad
+from livekit.agents.tokenize.basic import split_words
+# You need this import for the type hint in on_end_of_turn
+from livekit.agents.voice.audio_recognition import _EndOfTurnInfo 
+
+if TYPE_CHECKING:
+    from livekit.agents import Agent
+
+class CustomAgentActivity(AgentActivity):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    # --- 1. PREVENT INTERRUPTION (Agent keeps talking) ---
     def _interrupt_by_audio_activity(self) -> None:
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
 
-        # 1. Server-Side Check
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.turn_detection:
             return
 
-        # 2. THE SOLUTION: Check if we should ignore this noise
+        # Check if we should ignore this noise
         if self.stt is not None and self._audio_recognition is not None:
             text = self._audio_recognition.current_transcript
-            
-            # Use helper to check for Empty Text OR Filler Words
             if self._is_ignorable_transcript(text):
                 return
 
@@ -43,7 +58,6 @@ class CustomAgentActivity(AgentActivity): # <--- CHANGED from (Agent) to (AgentA
             if len(split_words(text, split_character=True)) < opt.min_interruption_words:
                 return
 
-        # 3. Execute Interruption
         if self._rt_session is not None:
             self._rt_session.start_user_activity()
 
@@ -53,7 +67,6 @@ class CustomAgentActivity(AgentActivity): # <--- CHANGED from (Agent) to (AgentA
             and self._current_speech.allow_interruptions
         ):
             self._paused_speech = self._current_speech
-
             if self._false_interruption_timer:
                 self._false_interruption_timer.cancel()
                 self._false_interruption_timer = None
@@ -66,12 +79,26 @@ class CustomAgentActivity(AgentActivity): # <--- CHANGED from (Agent) to (AgentA
                     self._rt_session.interrupt()
                 self._current_speech.interrupt()
 
+    # --- 2. PREVENT LLM PROCESSING (Don't send "Yeah" to the brain) ---
+    def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
+        # Check for ignorable text again at the end of the turn
+        if (
+            self.stt is not None
+            and self._turn_detection != "manual"
+            and self._current_speech is not None           
+            and self._current_speech.allow_interruptions
+            and not self._current_speech.interrupted
+        ):
+             # Use the same helper function
+            if self._is_ignorable_transcript(info.new_transcript):
+                self._cancel_preemptive_generation()
+                return False  # <--- RETURN FALSE DROPS THE TURN
+
+        # If it wasn't ignored, run the standard logic
+        return super().on_end_of_turn(info)
+
+    # --- HELPER FUNCTION ---
     def _is_ignorable_transcript(self, text: str) -> bool:
-        """
-        Decides if the agent should IGNORE the user input.
-        Returns True = Ignore (Agent keeps speaking).
-        Returns False = Interrupt (Agent stops).
-        """
         if not text or not text.strip():
             return True
 
@@ -87,7 +114,6 @@ class CustomAgentActivity(AgentActivity): # <--- CHANGED from (Agent) to (AgentA
 
         ignored_words = {"yeah", "ok", "okay", "hmm", "aha", "right", "uh-huh", "yep", "yup"}
         return all(w in ignored_words for w in words)
-
 
 class IntelligentInterruptSession(AgentSession):
     # This part was correct
